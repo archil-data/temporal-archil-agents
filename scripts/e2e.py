@@ -91,6 +91,11 @@ async def wait_until_all_agents_run(handle, n: int) -> None:
 
 
 async def main() -> int:
+    missing = [k for k in ("ARCHIL_API_KEY", "ARCHIL_REGION", "ANTHROPIC_API_KEY", "ARCHIL_IMAGE_ID") if not os.environ.get(k)]
+    if missing:
+        # Without these every agent fails and retries until its timeout.
+        print(f"missing environment: {', '.join(missing)}", file=sys.stderr)
+        return 2
     keep = "--keep" in sys.argv
     urls = [a for a in sys.argv[1:] if not a.startswith("--")] or DEFAULT_URLS
     OUT.mkdir(exist_ok=True)
