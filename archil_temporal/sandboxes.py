@@ -173,6 +173,7 @@ async def run_supervised(cfg: Config, spec: SandboxSpec, command: str, *, env: d
                 exited.cancel()
                 with contextlib.suppress(Exception):
                     await process.disconnect.aio()
+                activity.logger.info("detached from process %s; sandbox %s left running", process.id, sandbox.id)
                 raise ApplicationError("worker shutting down; sandbox left running for reattach", type="WorkerShutdown")
         return sandbox, exited.result()
     except asyncio.CancelledError:

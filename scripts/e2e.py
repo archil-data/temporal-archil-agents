@@ -40,7 +40,7 @@ DEFAULT_URLS = [
 ]
 OUT = Path("e2e-out")
 # How long to let the agents work before replacing the worker.
-WORK_BEFORE_SWAP_S = 30
+WORK_BEFORE_SWAP_S = 10
 
 
 # Never let a credential reach a log line or the uploaded artifact, even if an
@@ -135,7 +135,7 @@ async def main() -> int:
                     w.wait(timeout=60)
 
     log("checking the result")
-    detached = log_a.read_text().count("sandbox left running for reattach")
+    detached = log_a.read_text().count("detached from process")
     reattached = log_b.read_text().count("reattached to process")
     checks.append((f"all {len(urls)} tasks succeeded (failed: {result.failed or 'none'})", len(result.succeeded) == len(urls)))
     checks.append((f"worker A detached from {detached} running agent(s) on shutdown", detached > 0))
