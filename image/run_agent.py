@@ -94,8 +94,14 @@ async def main() -> int:
             permission_mode="bypassPermissions",
             max_turns=200,
             # IS_SANDBOX lets Claude Code skip permission prompts as root,
-            # which is fine here: the microVM is the security boundary.
-            env={"CLAUDE_CONFIG_DIR": str(CLAUDE_CONFIG_DIR), "IS_SANDBOX": "1"},
+            # which is fine here: the microVM is the security boundary. With
+            # restricted egress only the Anthropic API is reachable, so turn
+            # off Claude Code's other traffic (telemetry, update checks).
+            env={
+                "CLAUDE_CONFIG_DIR": str(CLAUDE_CONFIG_DIR),
+                "IS_SANDBOX": "1",
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            },
             **session,
         )
 
@@ -108,8 +114,8 @@ async def main() -> int:
         prompt = TASK_PROMPT.format(url=task["url"], work=WORK, out=OUT, columns=", ".join(columns))
         results = [await turn(prompt, options(session_id=session_id))]
 
-    error = None
-    for _ in range(MAX_FIX_ROUNDS + 1):
+    fix_round = 0
+    while True:
         if results[-1].is_error:
             print(f"agent error: {results[-1].errors or results[-1].subtype}", file=sys.stderr)
             return 1
@@ -120,9 +126,10 @@ async def main() -> int:
         if error is None:
             break
         print(f"validation failed: {error}", flush=True)
+        if fix_round == MAX_FIX_ROUNDS:
+            return 1
+        fix_round += 1
         results.append(await turn(FIX_PROMPT.format(out=OUT, error=error), options(resume=session_id)))
-    if error is not None:
-        return 1
 
     report = {
         "session_id": session_id,

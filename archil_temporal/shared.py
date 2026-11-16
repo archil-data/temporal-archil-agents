@@ -11,7 +11,7 @@ TASK_QUEUE = "archil-agents"
 
 # Every task's agent writes rows in this shape, so the final step can union
 # them without knowing anything about the sources. Change it to your
-# ClickHouse table's schema.
+# warehouse table's schema.
 OUTPUT_COLUMNS = {
     "source_url": "string",
     "entity": "string",
@@ -55,10 +55,20 @@ class AssembleResult:
 
 
 @dataclass
+class CleanupInput:
+    workflow_id: str
+    keys: list[str]
+
+
+@dataclass
 class IngestResult:
     merged: Optional[AssembleResult]
     succeeded: list[TaskResult] = field(default_factory=list)
     failed: dict[str, str] = field(default_factory=dict)
+
+
+def plan_tasks(workflow_id: str, urls: list[str]) -> list[AgentTask]:
+    return [AgentTask(workflow_id=workflow_id, key=f"t{i:03d}", url=url) for i, url in enumerate(urls)]
 
 
 # Names are derived from the workflow ID and task key, so a retried activity

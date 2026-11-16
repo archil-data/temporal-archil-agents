@@ -13,11 +13,12 @@ import time
 
 import pytest
 from archil import ArchilApiError, SandboxMountSpec
+from temporalio import activity
 from temporalio.exceptions import ApplicationError
 from temporalio.testing import ActivityEnvironment
 
 from archil_temporal import config
-from archil_temporal.sandboxes import SandboxSpec, client, ensure_disk, run_supervised, spin_down
+from archil_temporal.sandboxes import Heartbeater, SandboxSpec, client, ensure_disk, run_supervised, spin_down
 
 pytestmark = pytest.mark.skipif(
     not (os.environ.get("ARCHIL_API_KEY") and os.environ.get("ARCHIL_REGION")),
@@ -49,12 +50,17 @@ async def _status(sandbox_id: str) -> str:
         raise
 
 
+async def _attempt(spec):
+    async with Heartbeater() as hb:
+        return await run_supervised(config.load(), hb, spec, COMMAND, env={}, label="lifecycle")
+
+
 async def test_worker_shutdown_detaches_and_the_retry_reattaches(spec):
-    cfg = config.load()
     heartbeats: list[dict] = []
+    retry_heartbeats: list[dict] = []
 
     async def attempt():
-        return await run_supervised(cfg, spec, COMMAND, env={}, label="lifecycle")
+        return await _attempt(spec)
 
     first = ActivityEnvironment()
     first.on_heartbeat = lambda *details: heartbeats.append(details[0])
@@ -64,6 +70,7 @@ async def test_worker_shutdown_detaches_and_the_retry_reattaches(spec):
     with pytest.raises(ApplicationError) as detached:
         await running
     assert detached.value.type == "WorkerShutdown"
+    assert not detached.value.non_retryable
 
     checkpoint = heartbeats[-1]
     assert checkpoint["cursor"] > 0
@@ -71,8 +78,11 @@ async def test_worker_shutdown_detaches_and_the_retry_reattaches(spec):
 
     second = ActivityEnvironment()
     second.info = dataclasses.replace(second.info, heartbeat_details=[checkpoint])
+    second.on_heartbeat = lambda *details: retry_heartbeats.append(details[0])
     sandbox, result = await second.run(attempt)
-    assert sandbox.id == checkpoint["sandbox_id"]  # same sandbox, same process
+    # The retry took over the same process in the same sandbox, not a new one.
+    assert sandbox.id == checkpoint["sandbox_id"]
+    assert {h.get("process_id") for h in retry_heartbeats} == {checkpoint["process_id"]}
     assert (result.status, result.exit_code) == ("completed", 0)
     assert (await sandbox.exec.aio("cat /mnt/archil/marker")).stdout.strip() == "done"
 
@@ -81,13 +91,12 @@ async def test_worker_shutdown_detaches_and_the_retry_reattaches(spec):
 
 
 async def test_workflow_cancel_spins_the_sandbox_down(spec):
-    cfg = config.load()
     heartbeats: list[dict] = []
     env = ActivityEnvironment()
     env.on_heartbeat = lambda *details: heartbeats.append(details[0])
 
     async def attempt():
-        return await run_supervised(cfg, spec, COMMAND, env={}, label="lifecycle")
+        return await _attempt(spec)
 
     running = asyncio.ensure_future(env.run(attempt))
     await asyncio.sleep(8)
@@ -95,3 +104,22 @@ async def test_workflow_cancel_spins_the_sandbox_down(spec):
     with pytest.raises(asyncio.CancelledError):
         await running
     assert await _status(heartbeats[-1]["sandbox_id"]) in ("gone", "deleting", "deleted")
+
+
+async def test_superseded_attempt_leaves_the_sandbox_for_the_new_one(spec):
+    # After a heartbeat timeout Temporal starts a new attempt, which reattaches
+    # to the same process. If the old attempt is still alive, its heartbeats
+    # come back "not found": it must walk away, not delete the sandbox.
+    heartbeats: list[dict] = []
+    env = ActivityEnvironment()
+    env.on_heartbeat = lambda *details: heartbeats.append(details[0])
+
+    async def attempt():
+        return await _attempt(spec)
+
+    running = asyncio.ensure_future(env.run(attempt))
+    await asyncio.sleep(8)
+    env.cancel(activity.ActivityCancellationDetails(not_found=True))
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    assert await _status(heartbeats[-1]["sandbox_id"]) == "running"

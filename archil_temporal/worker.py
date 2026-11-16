@@ -13,7 +13,7 @@ from temporalio.client import Client
 from temporalio.worker import Worker
 
 from . import config
-from .activities import assemble, run_agent_task
+from .activities import assemble, clean_up, run_agent_task
 from .shared import TASK_QUEUE
 from .workflows import IngestWorkflow
 
@@ -26,7 +26,7 @@ async def main() -> None:
         client,
         task_queue=TASK_QUEUE,
         workflows=[IngestWorkflow],
-        activities=[run_agent_task, assemble],
+        activities=[run_agent_task, assemble, clean_up],
         max_concurrent_activities=cfg.max_concurrent_activities,
         # Activities detach from their sandboxes as soon as shutdown starts, so
         # this only needs to cover the detach itself.
@@ -41,7 +41,7 @@ async def main() -> None:
     async with worker:
         logging.info("worker running on task queue %r", TASK_QUEUE)
         await stop.wait()
-        logging.info("shutting down; in-flight sandboxes keep running for the next worker")
+        logging.info("shutting down; running agents are detached, not stopped")
 
 
 if __name__ == "__main__":

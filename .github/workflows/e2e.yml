@@ -19,9 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
-      ARCHIL_API_KEY: ${{ secrets.ARCHIL_API_KEY }}
       ARCHIL_REGION: ${{ vars.ARCHIL_REGION || 'aws-us-west-2' }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       IMAGE: ghcr.io/${{ github.repository }}-sandbox:${{ github.sha }}
     steps:
       - uses: actions/checkout@v4
@@ -47,14 +45,18 @@ jobs:
           python-version: "3.12"
       - run: pip install -e ".[test]"
 
+      # The API keys are given only to the two steps that need them.
       - name: Register the image with Archil
         env:
+          ARCHIL_API_KEY: ${{ secrets.ARCHIL_API_KEY }}
           REGISTRY_USERNAME: ${{ github.actor }}
           REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: python -m archil_temporal.build_image "$IMAGE" >> "$GITHUB_ENV"
 
       - name: Run agents, replace the worker mid-run, check the result
         env:
+          ARCHIL_API_KEY: ${{ secrets.ARCHIL_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           URLS: ${{ inputs.urls }}
         run: python scripts/e2e.py $URLS
 

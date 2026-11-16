@@ -4,13 +4,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git \
     && rm -rf /var/lib/apt/lists/*
 
-# Put the heavy tools your agents reach for here (LibreOffice, Playwright and
-# Chromium, ...). They're paid for once, when Archil builds the image, not on
+# Put the heavier tools your agents reach for here (system packages, headless
+# browsers, ...). They're paid for once, when Archil builds the image, not on
 # every sandbox start.
-#
-# RUN apt-get update && apt-get install -y --no-install-recommends libreoffice-calc \
-#     && rm -rf /var/lib/apt/lists/*
-# RUN pip install --no-cache-dir playwright && playwright install --with-deps chromium
 
 # claude-agent-sdk bundles the Claude Code CLI; no Node.js needed.
 RUN pip install --no-cache-dir \

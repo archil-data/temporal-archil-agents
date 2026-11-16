@@ -5,14 +5,13 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      # The lifecycle tests skip themselves when these aren't configured.
-      ARCHIL_API_KEY: ${{ secrets.ARCHIL_API_KEY }}
-      ARCHIL_REGION: ${{ vars.ARCHIL_REGION || 'aws-us-west-2' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,4 +19,9 @@ jobs:
           python-version: "3.12"
       - run: pip install -e ".[test]"
       - name: Workflow tests (stub activities) and sandbox lifecycle tests (live Archil API)
+        env:
+          # Only this step sees the key. The lifecycle tests skip themselves
+          # without it (as on pull requests from forks, which get no secrets).
+          ARCHIL_API_KEY: ${{ secrets.ARCHIL_API_KEY }}
+          ARCHIL_REGION: ${{ vars.ARCHIL_REGION || 'aws-us-west-2' }}
         run: pytest -v -rs --log-cli-level=INFO

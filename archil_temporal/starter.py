@@ -6,7 +6,7 @@ import asyncio
 import dataclasses
 import json
 import sys
-import time
+import uuid
 
 from temporalio.client import Client
 
@@ -28,7 +28,7 @@ async def main() -> None:
     handle = await client.start_workflow(
         IngestWorkflow.run,
         IngestRequest(urls=urls),
-        id=f"ingest-{int(time.time())}",
+        id=f"ingest-{uuid.uuid4().hex[:12]}",
         task_queue=TASK_QUEUE,
     )
     print(f"started {handle.id} with {len(urls)} task(s); waiting for the result...")
