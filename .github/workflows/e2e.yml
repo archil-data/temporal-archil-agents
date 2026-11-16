@@ -1,0 +1,65 @@
+name: e2e
+
+# Real Claude agents in real Archil sandboxes, with the Temporal worker
+# replaced mid-run. Manual only: each run spends Anthropic and Archil credit.
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: Space-separated URLs to ingest (blank for the two demo datasets)
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      ARCHIL_API_KEY: ${{ secrets.ARCHIL_API_KEY }}
+      ARCHIL_REGION: ${{ vars.ARCHIL_REGION || 'aws-us-west-2' }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      IMAGE: ghcr.io/${{ github.repository }}-sandbox:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/setup-buildx-action@v3
+      - name: Build and push the sandbox image
+        uses: docker/build-push-action@v6
+        with:
+          context: image
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[test]"
+
+      - name: Register the image with Archil
+        env:
+          REGISTRY_USERNAME: ${{ github.actor }}
+          REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+        run: python -m archil_temporal.build_image "$IMAGE" >> "$GITHUB_ENV"
+
+      - name: Run agents, replace the worker mid-run, check the result
+        env:
+          URLS: ${{ inputs.urls }}
+        run: python scripts/e2e.py $URLS
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-out
+          path: e2e-out/
