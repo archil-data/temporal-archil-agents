@@ -43,6 +43,17 @@ OUT = Path("e2e-out")
 WORK_BEFORE_SWAP_S = 30
 
 
+# Never let a credential reach a log line or the uploaded artifact, even if an
+# agent prints its environment. (Actions masks its own logs, not artifacts.)
+_SECRETS = [v for k in ("ANTHROPIC_API_KEY", "ARCHIL_API_KEY") if len(v := os.environ.get(k, "")) >= 8]
+
+
+def redact(text: str) -> str:
+    for secret in _SECRETS:
+        text = text.replace(secret, "***")
+    return text
+
+
 def log(msg: str) -> None:
     print(f"\n=== {time.strftime('%H:%M:%S')} {msg}", flush=True)
 
@@ -60,6 +71,7 @@ def start_worker(name: str, address: str) -> tuple[subprocess.Popen, Path]:
     def tee() -> None:
         with path.open("w") as f:
             for line in proc.stdout:
+                line = redact(line)
                 f.write(line)
                 f.flush()
                 if "HTTP Request" not in line:
@@ -160,7 +172,7 @@ async def main() -> int:
         lines += ["", "First rows of `merged.parquet`:", "", "| " + " | ".join(table.column_names) + " |",
                   "|" + "---|" * len(table.column_names),
                   *["| " + " | ".join(str(v) for v in row.values()) + " |" for row in sample]]
-    summary = "\n".join(lines)
+    summary = redact("\n".join(lines))
     (OUT / "summary.md").write_text(summary)
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
