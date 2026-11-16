@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import shlex
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Optional
@@ -28,6 +29,13 @@ from .config import Config
 log = logging.getLogger(__name__)
 
 HEARTBEAT_EVERY_S = 10
+# Temporal sends an attempt's first heartbeat at once but throttles the rest
+# (to 80% of heartbeat_timeout), so the first one should carry the process
+# checkpoint. Heartbeat during setup only if setup is slow.
+SETUP_HEARTBEAT_AFTER_S = 30
+# Where the activity records the supervised process's ID inside the sandbox,
+# so a retry can find the process even if no checkpoint reached Temporal.
+PROCESS_MARKER = "/tmp/archil-temporal-process"
 
 # Statuses from which a sandbox can be brought back to "running".
 _REUSABLE = {"pending", "running", "pausing", "paused", "stopping", "stopped"}
@@ -140,9 +148,9 @@ async def spin_down(sandbox) -> None:
 
 
 class Heartbeater:
-    """Heartbeats the activity's checkpoint every few seconds from the moment
-    it starts, including while disks and sandboxes are still being set up, so
-    a slow start never looks like a dead worker.
+    """Heartbeats the activity's checkpoint for as long as it runs, including
+    while disks and sandboxes are still being set up if that is slow, so a
+    slow start never looks like a dead worker.
 
     Until this attempt has a process of its own, it re-sends the previous
     attempt's checkpoint, so a retry that dies early doesn't lose it."""
@@ -165,6 +173,7 @@ class Heartbeater:
         activity.heartbeat(dict(self.checkpoint))
 
     async def _run(self) -> None:
+        await asyncio.sleep(SETUP_HEARTBEAT_AFTER_S)
         while True:
             activity.heartbeat(dict(self.checkpoint))
             await asyncio.sleep(HEARTBEAT_EVERY_S)
@@ -199,14 +208,17 @@ async def run_supervised(
     on_output = _printer(label)
 
     process = None
-    if checkpoint.get("process_id") and checkpoint.get("sandbox_id") == sandbox.id:
+    process_id, cursor = None, 0
+    if checkpoint.get("sandbox_id") == sandbox.id:
+        process_id, cursor = checkpoint.get("process_id"), checkpoint.get("cursor", 0)
+    if not process_id:
+        # No checkpoint (the last attempt died before its first heartbeat
+        # reached Temporal): look for the process it may have started.
+        found = await sandbox.exec.aio(f"cat {PROCESS_MARKER} 2>/dev/null || true")
+        process_id = found.stdout.strip() or None
+    if process_id:
         try:
-            process = await sandbox.attach.aio(
-                checkpoint["process_id"],
-                offset=checkpoint.get("cursor", 0),
-                on_output=on_output,
-                collect_output=False,
-            )
+            process = await sandbox.attach.aio(process_id, offset=cursor, on_output=on_output, collect_output=False)
             activity.logger.info("reattached to process %s", process.id)
         except RuntimeError as e:
             # The runtime answered, and the process isn't there (the sandbox
@@ -215,9 +227,10 @@ async def run_supervised(
             # may still be running would be worse than retrying.
             if not str(e).startswith("process_not_found"):
                 raise
-            activity.logger.info("process %s is gone; starting a new one", checkpoint["process_id"])
+            activity.logger.info("process %s is gone; starting a new one", process_id)
     if process is None:
         process = await sandbox.run.aio(command, env=env, on_output=on_output, collect_output=False)
+        await sandbox.exec.aio(f"echo {shlex.quote(process.id)} > {PROCESS_MARKER}")
 
     def checkpoint_now() -> None:
         hb.beat(sandbox_id=sandbox.id, process_id=process.id, cursor=process.cursor)
@@ -239,11 +252,14 @@ async def run_supervised(
                 activity.logger.info("detached from process %s; sandbox %s left running", process.id, sandbox.id)
                 raise _retry_soon("worker shutting down; sandbox left running for reattach", "WorkerShutdown")
         try:
-            return sandbox, exited.result()
+            result = exited.result()
         except ConnectionError as e:
             # The WebSocket dropped, not the process: let the retry reattach.
             activity.logger.info("lost connection to process %s (%s); retrying to reattach", process.id, e)
             raise _retry_soon(f"lost connection to the sandbox process: {e}", "ConnectionLost") from e
+        # It exited; a retry must start a new process, not find this one.
+        await sandbox.exec.aio(f"rm -f {PROCESS_MARKER}")
+        return sandbox, result
     except asyncio.CancelledError:
         exited.cancel()
         reason = activity.cancellation_details()

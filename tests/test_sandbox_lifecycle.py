@@ -123,3 +123,30 @@ async def test_superseded_attempt_leaves_the_sandbox_for_the_new_one(spec):
     with pytest.raises(asyncio.CancelledError):
         await running
     assert await _status(heartbeats[-1]["sandbox_id"]) == "running"
+
+
+async def test_retry_without_a_checkpoint_finds_the_running_process(spec):
+    # A worker that crashes right after starting the process may never get a
+    # heartbeat to Temporal. The retry must still find that process rather
+    # than start a second agent next to it.
+    heartbeats: list[dict] = []
+    retry_heartbeats: list[dict] = []
+
+    async def attempt():
+        return await _attempt(spec)
+
+    first = ActivityEnvironment()
+    first.on_heartbeat = lambda *details: heartbeats.append(details[0])
+    running = asyncio.ensure_future(first.run(attempt))
+    await asyncio.sleep(8)
+    first.worker_shutdown()
+    with pytest.raises(ApplicationError):
+        await running
+
+    second = ActivityEnvironment()  # no heartbeat details at all
+    second.on_heartbeat = lambda *details: retry_heartbeats.append(details[0])
+    sandbox, result = await second.run(attempt)
+    assert sandbox.id == heartbeats[-1]["sandbox_id"]
+    assert {h.get("process_id") for h in retry_heartbeats} == {heartbeats[-1]["process_id"]}
+    assert (result.status, result.exit_code) == ("completed", 0)
+    await spin_down(sandbox)

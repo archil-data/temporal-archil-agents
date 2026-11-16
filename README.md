@@ -55,7 +55,7 @@ the sandbox instead.)
 | Agent fails (crash, bad output) | Deletes the sandbox; Temporal retries, up to `MAX_AGENT_FAILURES` failures | Next attempt starts a fresh sandbox and resumes the same Claude session on the same disk |
 | Worker shuts down (deploy, scale-in, node drain) | Detaches at once; Temporal retries a second later | **Keeps running.** The retry reattaches to the same process from the heartbeat checkpoint and picks up its output where it left off |
 | Connection to the sandbox drops | Same as a worker shutdown | Keeps running, and is reattached |
-| Worker crashes | Nothing (it's gone) | Keeps running. After `heartbeat_timeout`, Temporal retries on another worker, which reattaches. If the old attempt turns out to be alive, it sees it was superseded and only disconnects |
+| Worker crashes | Nothing (it's gone) | Keeps running. After `heartbeat_timeout`, Temporal retries on another worker, which reattaches (even if the crash came before the first heartbeat: the process ID is also recorded in the sandbox). If the old attempt turns out to be alive, it sees it was superseded and only disconnects |
 | Workflow cancelled | Kills the process, stops and deletes the sandbox. The workflow then runs a cleanup step that deletes any sandbox left over (say, from a task that was waiting to retry) | Stopped |
 
 Detaching never counts as a failure: a task survives any number of deploys
@@ -142,7 +142,8 @@ pytest -v
   loop standing in for the agent. It checks that a worker shutdown leaves the
   sandbox running and the retry takes over the same process, that cancelling
   deletes the sandbox, and that a superseded attempt leaves the sandbox to the
-  attempt that replaced it. It needs `ARCHIL_API_KEY` and `ARCHIL_REGION`, and
+  attempt that replaced it, and that a retry with no checkpoint finds the
+  running process. It needs `ARCHIL_API_KEY` and `ARCHIL_REGION`, and
   skips itself without them.
 - `scripts/e2e.py` is the full demo: real agents in sandboxes from your image,
   on a local Temporal dev server. It stops the worker mid-run, starts a new one,

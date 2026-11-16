@@ -29,6 +29,7 @@ import urllib.request
 from pathlib import Path
 
 import pyarrow.parquet as pq
+from temporalio.client import WorkflowExecutionStatus
 from temporalio.testing import WorkflowEnvironment
 
 from archil_temporal.activities import clean_up_workflow
@@ -101,7 +102,10 @@ class WorkerProcess:
 
 async def wait_until_all_agents_run(handle, n: int) -> None:
     while True:
-        pending = (await handle.describe()).raw_description.pending_activities
+        description = await handle.describe()
+        if description.status != WorkflowExecutionStatus.RUNNING:
+            raise RuntimeError(f"workflow finished ({description.status.name}) before every agent was seen running")
+        pending = description.raw_description.pending_activities
         running = [p for p in pending if p.activity_type.name == "run_agent_task" and p.HasField("heartbeat_details")]
         if len(running) == n and all("process_id" in p.heartbeat_details.payloads[0].data.decode() for p in running):
             return
