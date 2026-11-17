@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from datetime import timedelta
 from collections import Counter
 
 import pytest
@@ -95,7 +96,15 @@ class Stubs:
 
 def workers(env, stubs: Stubs) -> tuple[Worker, Worker]:
     control = Worker(env.client, task_queue=CONTROL_QUEUE, workflows=[IngestWorkflow], activities=stubs.control)
-    sandbox = Worker(env.client, task_queue=SANDBOX_QUEUE, activities=stubs.sandbox)
+    # Send heartbeats (which carry cancellation back) every second rather than
+    # every 48s, so a cancel reaches the agent quickly.
+    sandbox = Worker(
+        env.client,
+        task_queue=SANDBOX_QUEUE,
+        activities=stubs.sandbox,
+        max_heartbeat_throttle_interval=timedelta(seconds=1),
+        default_heartbeat_throttle_interval=timedelta(seconds=1),
+    )
     return control, sandbox
 
 
@@ -132,7 +141,9 @@ async def test_cancelling_the_workflow_deletes_the_running_sandbox():
     urls = ["slow", "ok"]
     workflow_id = f"test-{uuid.uuid4()}"
     stubs = Stubs(workflow_id, urls)
-    async with await WorkflowEnvironment.start_time_skipping() as env:
+    # A real (local) server: time skipping would run the activity's heartbeat
+    # timeout out from under the cancel.
+    async with await WorkflowEnvironment.start_local() as env:
         control, sandbox = workers(env, stubs)
         async with control, sandbox:
             handle = await env.client.start_workflow(
@@ -141,7 +152,7 @@ async def test_cancelling_the_workflow_deletes_the_running_sandbox():
             await asyncio.wait_for(stubs.agent_started.wait(), timeout=30)
             await handle.cancel()
             with pytest.raises(WorkflowFailureError) as failure:
-                await handle.result()
+                await asyncio.wait_for(handle.result(), timeout=60)
 
     assert isinstance(failure.value.cause, CancelledError)
     names = all_names(workflow_id, urls)
