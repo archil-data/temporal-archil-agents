@@ -8,10 +8,8 @@ import json
 import sys
 import uuid
 
-from temporalio.client import Client
-
 from . import config
-from .shared import TASK_QUEUE, IngestRequest, IngestResult
+from .shared import CONTROL_QUEUE, IngestRequest, IngestResult
 from .workflows import IngestWorkflow
 
 DEMO_URLS = [
@@ -24,12 +22,12 @@ DEMO_URLS = [
 async def main() -> None:
     cfg = config.load()
     urls = sys.argv[1:] or DEMO_URLS
-    client = await Client.connect(cfg.temporal_address, namespace=cfg.temporal_namespace)
+    client = await config.connect(cfg)
     handle = await client.start_workflow(
         IngestWorkflow.run,
         IngestRequest(urls=urls),
         id=f"ingest-{uuid.uuid4().hex[:12]}",
-        task_queue=TASK_QUEUE,
+        task_queue=CONTROL_QUEUE,
     )
     print(f"started {handle.id} with {len(urls)} task(s); waiting for the result...")
     result: IngestResult = await handle.result()

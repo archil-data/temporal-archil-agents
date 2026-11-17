@@ -2,59 +2,107 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
+from typing import Any
 
 from temporalio import workflow
 from temporalio.common import RetryPolicy
-from temporalio.exceptions import ActivityError
+from temporalio.exceptions import ActivityError, TimeoutError, TimeoutType
 from temporalio.workflow import ActivityCancellationType
 
 with workflow.unsafe.imports_passed_through():
-    from .activities import assemble, clean_up, run_agent_task
-    from .shared import AgentTask, AssembleInput, CleanupInput, IngestRequest, IngestResult, plan_tasks
+    from .control import ControlActivities
+    from .shared import (
+        CONTROL_QUEUE,
+        AgentTask,
+        AssembleInput,
+        AssembleOutput,
+        AssembleResult,
+        CleanupInput,
+        IngestRequest,
+        IngestResult,
+        Mount,
+        SandboxRequest,
+        ShareRequest,
+        TaskResult,
+        all_names,
+        merged_name,
+        plan_tasks,
+        task_name,
+    )
+
+# How many times to start a fresh sandbox for one piece of work if its sandbox
+# is lost (no worker picks the work up). A crash of the worker process alone is
+# handled by the sandbox, which restarts it.
+MAX_SANDBOX_LAUNCHES = 3
+
+_CONTROL = dict(
+    task_queue=CONTROL_QUEUE,
+    start_to_close_timeout=timedelta(minutes=10),
+    heartbeat_timeout=timedelta(minutes=1),
+)
+
+
+def agent_sandbox(task: AgentTask) -> SandboxRequest:
+    from urllib.parse import urlparse
+
+    return SandboxRequest(
+        name=task_name(task),
+        mounts=[Mount(disk=task_name(task), path="/mnt/archil")],
+        vcpus=2,
+        mem_mib=4096,
+        # The agent can reach the Anthropic API and the host of its URL, and
+        # nothing else (besides Temporal).
+        allow_hosts=["api.anthropic.com", urlparse(task.url).hostname or ""],
+    )
+
+
+def assemble_sandbox(workflow_id: str, tasks: list[TaskResult]) -> SandboxRequest:
+    # Every task disk read-only (several sandboxes can mount a disk read-only
+    # at once), plus one writable output disk.
+    return SandboxRequest(
+        name=merged_name(workflow_id),
+        mounts=[Mount(disk=merged_name(workflow_id), path="/mnt/out")]
+        + [Mount(disk=t.disk, path=f"/mnt/tasks/{t.key}", read_only=True) for t in tasks],
+        vcpus=4,
+        mem_mib=8192,
+        allow_hosts=[],
+    )
+
+
+def _sandbox_lost(e: ActivityError) -> bool:
+    # Nothing polled the sandbox's queue: the sandbox itself is gone.
+    return isinstance(e.cause, TimeoutError) and e.cause.type == TimeoutType.SCHEDULE_TO_START
 
 
 @workflow.defn
 class IngestWorkflow:
-    """Fan out one Claude agent per URL, each in its own Archil sandbox, then merge."""
+    """Run one Claude agent per URL, each in its own Archil sandbox, then merge."""
 
     @workflow.run
     async def run(self, req: IngestRequest) -> IngestResult:
         wf_id = workflow.info().workflow_id
-        tasks = plan_tasks(wf_id, req.urls)
+        self.start_timeout = timedelta(seconds=req.sandbox_start_timeout_s)
         try:
-            return await self._ingest(wf_id, tasks)
+            return await self._ingest(wf_id, plan_tasks(wf_id, req.urls))
         finally:
             # Runs whether the workflow succeeds, fails, or is cancelled, and
-            # deletes any sandbox an activity couldn't (for example, one whose
-            # retry was still waiting to start when the workflow was cancelled).
-            # Terminating a workflow skips this; see the README.
-            await workflow.execute_activity(
-                clean_up,
-                CleanupInput(workflow_id=wf_id, keys=[t.key for t in tasks]),
-                start_to_close_timeout=timedelta(minutes=5),
+            # deletes any sandbox that is somehow still there.
+            await workflow.execute_activity_method(
+                ControlActivities.clean_up, CleanupInput(names=all_names(wf_id, req.urls)), **_CONTROL
             )
 
     async def _ingest(self, wf_id: str, tasks: list[AgentTask]) -> IngestResult:
         outcomes = await asyncio.gather(
             *[
-                workflow.execute_activity(
-                    run_agent_task,
+                self.in_sandbox(
+                    agent_sandbox(task),
+                    "run_agent_task",
                     task,
-                    # The whole budget for the task, across every attempt. There
-                    # is no attempt limit: a deploy or a dropped connection is
-                    # an attempt too, and must never fail the task. The activity
-                    # itself gives up after a few genuine agent failures.
-                    schedule_to_close_timeout=timedelta(hours=6),
-                    # A worker that dies stops heartbeating; after this long the
-                    # task is retried elsewhere and reattaches to the sandbox.
-                    heartbeat_timeout=timedelta(minutes=1),
-                    retry_policy=RetryPolicy(
-                        initial_interval=timedelta(seconds=5),
-                        maximum_interval=timedelta(minutes=1),
-                        non_retryable_error_types=["AgentGaveUp"],
-                    ),
-                    # On cancel, wait for the activity to delete its sandbox.
-                    cancellation_type=ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+                    TaskResult,
+                    timeout=timedelta(hours=6),
+                    # An agent that crashes or writes invalid output gets two
+                    # more tries, resuming its Claude session each time.
+                    retry_policy=RetryPolicy(maximum_attempts=3, non_retryable_error_types=["AgentGaveUp"]),
                 )
                 for task in tasks
             ],
@@ -71,12 +119,48 @@ class IngestWorkflow:
                 result.succeeded.append(outcome)
 
         if result.succeeded:
-            result.merged = await workflow.execute_activity(
-                assemble,
+            merged: AssembleOutput = await self.in_sandbox(
+                assemble_sandbox(wf_id, result.succeeded),
+                "assemble",
                 AssembleInput(workflow_id=wf_id, tasks=result.succeeded),
-                schedule_to_close_timeout=timedelta(hours=2),
-                heartbeat_timeout=timedelta(minutes=1),
-                retry_policy=RetryPolicy(maximum_interval=timedelta(minutes=1)),
-                cancellation_type=ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+                AssembleOutput,
+                timeout=timedelta(hours=2),
+                retry_policy=RetryPolicy(maximum_attempts=3, non_retryable_error_types=["AssembleFailed"]),
             )
+            url = await workflow.execute_activity_method(
+                ControlActivities.share_file, ShareRequest(disk=merged_name(wf_id), path=merged.path), **_CONTROL
+            )
+            result.merged = AssembleResult(disk=merged_name(wf_id), rows=merged.rows, download_url=url)
         return result
+
+    async def in_sandbox(
+        self, sandbox: SandboxRequest, activity: str, arg: Any, result_type: type, *, timeout: timedelta, retry_policy: RetryPolicy
+    ) -> Any:
+        """Run ``activity`` on a Temporal worker inside its own sandbox: start
+        the sandbox, send the activity to the sandbox's task queue, then delete
+        the sandbox once the activity has finished, failed, or been cancelled."""
+        try:
+            for launch in range(1, MAX_SANDBOX_LAUNCHES + 1):
+                worker = await workflow.execute_activity_method(ControlActivities.start_sandbox, sandbox, **_CONTROL)
+                try:
+                    return await workflow.execute_activity(
+                        activity,
+                        arg,
+                        result_type=result_type,
+                        task_queue=worker.task_queue,
+                        schedule_to_close_timeout=timeout,
+                        # The worker in the sandbox picks the activity up at
+                        # once; if nothing does for this long, the sandbox is gone.
+                        schedule_to_start_timeout=self.start_timeout,
+                        # Missed heartbeats mean the worker process died; the
+                        # sandbox restarts it and the retry runs there.
+                        heartbeat_timeout=timedelta(minutes=1),
+                        retry_policy=retry_policy,
+                        cancellation_type=ActivityCancellationType.WAIT_CANCELLATION_COMPLETED,
+                    )
+                except ActivityError as e:
+                    if not _sandbox_lost(e) or launch == MAX_SANDBOX_LAUNCHES:
+                        raise
+                    workflow.logger.info("sandbox %s was lost; starting a new one", worker.sandbox_id)
+        finally:
+            await workflow.execute_activity_method(ControlActivities.stop_sandbox, sandbox.name, **_CONTROL)

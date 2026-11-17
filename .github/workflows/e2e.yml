@@ -1,7 +1,7 @@
 name: e2e
 
-# Real Claude agents in real Archil sandboxes, with the Temporal worker
-# replaced mid-run. Manual only: each run spends Anthropic and Archil credit.
+# Temporal activities on workers inside Archil sandboxes, with real Claude
+# agents. Manual only: each run spends Anthropic and Archil credit.
 on:
   workflow_dispatch:
     inputs:
@@ -33,7 +33,8 @@ jobs:
       - name: Build and push the sandbox image
         uses: docker/build-push-action@v6
         with:
-          context: image
+          context: .
+          file: image/Dockerfile
           platforms: linux/amd64
           push: true
           tags: ${{ env.IMAGE }}
@@ -53,7 +54,7 @@ jobs:
           REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         run: python -m archil_temporal.build_image "$IMAGE" >> "$GITHUB_ENV"
 
-      - name: Run agents, replace the worker mid-run, check the result
+      - name: Run agents in sandboxes, disrupt their workers mid-run, check the result
         env:
           ARCHIL_API_KEY: ${{ secrets.ARCHIL_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}

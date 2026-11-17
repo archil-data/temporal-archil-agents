@@ -1,3 +1,7 @@
+# The sandbox image: the Temporal worker that runs in each sandbox, the agent's
+# tools, and this package. Build it from the repository root:
+#
+#   docker buildx build --platform linux/amd64 -f image/Dockerfile -t <image> --push .
 FROM python:3.12-slim
 
 RUN apt-get update \
@@ -8,12 +12,9 @@ RUN apt-get update \
 # browsers, ...). They're paid for once, when Archil builds the image, not on
 # every sandbox start.
 
-# claude-agent-sdk bundles the Claude Code CLI; no Node.js needed.
-RUN pip install --no-cache-dir \
-    "claude-agent-sdk==0.2.182" \
-    "duckdb>=1.1" \
-    "openpyxl>=3.1" \
-    "pandas>=2.2" \
-    "pyarrow>=17"
-
-COPY run_agent.py assemble.py /opt/agent/
+WORKDIR /opt/app
+COPY pyproject.toml README.md ./
+COPY archil_temporal ./archil_temporal
+# The "sandbox" extra adds the Claude Agent SDK (which bundles the Claude Code
+# CLI; no Node.js needed), DuckDB, pandas, and pyarrow.
+RUN pip install --no-cache-dir ".[sandbox]"

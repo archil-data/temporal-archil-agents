@@ -1,7 +1,7 @@
 [project]
 name = "archil-temporal-agents"
 version = "0.1.0"
-description = "Run each Temporal activity as a Claude agent in its own Archil sandbox"
+description = "Run each Temporal activity on a worker in its own Archil sandbox"
 readme = "README.md"
 license = { file = "LICENSE" }
 requires-python = ">=3.10"
@@ -11,6 +11,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# What the worker inside each sandbox needs (installed by image/Dockerfile).
+sandbox = ["claude-agent-sdk==0.2.182", "duckdb>=1.1", "openpyxl>=3.1", "pandas>=2.2", "pyarrow>=17"]
 test = ["pytest>=8", "pytest-asyncio>=0.23", "pyarrow>=17"]
 
 [tool.pytest.ini_options]

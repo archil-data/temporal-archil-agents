@@ -1,9 +1,12 @@
-"""Settings read from the environment. See .env.example."""
+"""Settings read from the environment (see .env.example), and the Temporal connection."""
 
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Optional
+
+from temporalio.client import Client
 
 
 def _flag(name: str, default: bool) -> bool:
@@ -14,54 +17,76 @@ def _flag(name: str, default: bool) -> bool:
 class Config:
     temporal_address: str
     temporal_namespace: str
-    # Exactly one of these chooses the sandbox image. image_id comes from
-    # `python -m archil_temporal.build_image`; base_image is any public OCI
-    # reference and is only useful for trying the plumbing out.
-    image_id: str | None
-    base_image: str | None
+    # Temporal Cloud API key; implies TLS.
+    temporal_api_key: Optional[str]
+    temporal_tls: bool
+    # For testing against a Temporal server in an Archil sandbox: its exposed
+    # port's hostname. Connections go through a local TLS tunnel (see tunnel.py).
+    temporal_tunnel_host: Optional[str]
+    # The sandbox image: image_id from `python -m archil_temporal.build_image`.
+    image_id: Optional[str]
     anthropic_api_key: str
     agent_model: str
-    agent_vcpus: int
-    agent_mem_mib: int
-    # How many times an agent may fail (crash, invalid output) before its task
-    # is given up on. Worker shutdowns and dropped connections don't count.
-    max_agent_failures: int
-    # Deny the agent's sandbox all outbound traffic except the Anthropic API
-    # (with the API key added outside the VM) and the host of its URL. Needs a
-    # paid Archil plan; set RESTRICT_EGRESS=false on a free one.
+    # Deny agents all outbound traffic except Temporal, the Anthropic API (with
+    # the API key added outside the VM), and the host of the agent's URL.
+    # Needs a paid Archil plan; set RESTRICT_EGRESS=false on a free one.
     restrict_egress: bool
-    # Extra hosts agents may reach when egress is restricted.
     extra_allowed_hosts: tuple[str, ...]
-    # Pause a sandbox that has been running this long without stopping. Set
-    # it to at least the activity's schedule_to_close_timeout.
+    # Pause a sandbox that has been running this long. A backstop for
+    # sandboxes whose workflow was terminated; set it to at least your
+    # longest task.
     sandbox_max_ttl_s: int
-    # How long a sandbox keeps running with no worker attached before Archil
-    # pauses it. Long enough for Temporal to retry onto another worker, short
-    # enough that an abandoned sandbox doesn't keep using CPU.
-    sandbox_orphan_ttl_s: int
     max_concurrent_activities: int
 
+    @property
+    def temporal_host(self) -> str:
+        """The host a sandbox's worker connects to, for its egress policy."""
+        return self.temporal_tunnel_host or self.temporal_address.rsplit(":", 1)[0]
 
-def load(require_image: bool = True) -> Config:
-    image_id = os.environ.get("ARCHIL_IMAGE_ID") or None
-    base_image = os.environ.get("AGENT_BASE_IMAGE") or None
-    if require_image and not image_id and not base_image:
-        raise SystemExit("Set ARCHIL_IMAGE_ID (see README: Build the image) or AGENT_BASE_IMAGE")
+
+def load() -> Config:
+    tls = _flag("TEMPORAL_TLS", False) or bool(os.environ.get("TEMPORAL_API_KEY"))
     return Config(
         temporal_address=os.environ.get("TEMPORAL_ADDRESS", "localhost:7233"),
         temporal_namespace=os.environ.get("TEMPORAL_NAMESPACE", "default"),
-        image_id=image_id,
-        base_image=None if image_id else base_image,
+        temporal_api_key=os.environ.get("TEMPORAL_API_KEY") or None,
+        temporal_tls=tls,
+        temporal_tunnel_host=os.environ.get("TEMPORAL_TUNNEL_HOST") or None,
+        image_id=os.environ.get("ARCHIL_IMAGE_ID") or None,
         anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
         agent_model=os.environ.get("AGENT_MODEL", "claude-opus-5-5"),
-        agent_vcpus=int(os.environ.get("AGENT_VCPUS", "2")),
-        agent_mem_mib=int(os.environ.get("AGENT_MEM_MIB", "4096")),
-        max_agent_failures=int(os.environ.get("MAX_AGENT_FAILURES", "3")),
         restrict_egress=_flag("RESTRICT_EGRESS", True),
         extra_allowed_hosts=tuple(
             h.strip().lower() for h in os.environ.get("AGENT_ALLOWED_HOSTS", "").split(",") if h.strip()
         ),
         sandbox_max_ttl_s=int(os.environ.get("SANDBOX_MAX_TTL_SECONDS", str(6 * 3600))),
-        sandbox_orphan_ttl_s=int(os.environ.get("SANDBOX_ORPHAN_TTL_SECONDS", "900")),
-        max_concurrent_activities=int(os.environ.get("MAX_CONCURRENT_ACTIVITIES", "500")),
+        max_concurrent_activities=int(os.environ.get("MAX_CONCURRENT_ACTIVITIES", "100")),
+    )
+
+
+def temporal_env(cfg: Config) -> dict[str, str]:
+    """What a sandbox's worker needs to connect to the same Temporal."""
+    env = {"TEMPORAL_ADDRESS": cfg.temporal_address, "TEMPORAL_NAMESPACE": cfg.temporal_namespace}
+    if cfg.temporal_tls:
+        env["TEMPORAL_TLS"] = "true"
+    if cfg.temporal_api_key:
+        env["TEMPORAL_API_KEY"] = cfg.temporal_api_key
+    if cfg.temporal_tunnel_host:
+        env["TEMPORAL_TUNNEL_HOST"] = cfg.temporal_tunnel_host
+    return env
+
+
+async def connect(cfg: Config, identity: Optional[str] = None) -> Client:
+    extra = {"identity": identity} if identity else {}
+    if cfg.temporal_tunnel_host:
+        from .tunnel import open_tunnel
+
+        address = await open_tunnel(cfg.temporal_tunnel_host)
+        return await Client.connect(address, namespace=cfg.temporal_namespace, **extra)
+    return await Client.connect(
+        cfg.temporal_address,
+        namespace=cfg.temporal_namespace,
+        api_key=cfg.temporal_api_key,
+        tls=cfg.temporal_tls,
+        **extra,
     )
